@@ -1,0 +1,13 @@
+[project]
+name = "telegram-bot"
+version = "0.1.0"
+description = "A personal bot dedicated to executing different automations"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "flask>=3.1.2",
+    "pydantic-settings>=2.12.0",
+    "requests>=2.32.5",
+    "rich>=14.2.0",
+    "selenium>=4.38.0",
+]
