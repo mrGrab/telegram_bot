@@ -44,7 +44,6 @@ class Settings(BaseSettings):
 try:
     settings = Settings()
 except Exception as e:
-    print(
-        f"ERROR: Failed to load settings. Ensure required variables are set.")
+    print("ERROR: Failed to load settings. Ensure required variables are set")
     print(f"Pydantic Error: {e}")
     sys.exit(1)

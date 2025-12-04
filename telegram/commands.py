@@ -1,10 +1,11 @@
+from pathlib import Path
 from typing import Dict, Callable
 from telegram.bot import TelegramBot
 from core.logger import logger
 from core.config import settings
 
 from scripts.check_alexa import check_connection
-from scripts.dtek_monitor import run_monitor
+from scripts.dtek_monitor import MonitorContext, MonitorService
 from scripts.electricity_status import get_electricity_status
 
 
@@ -60,10 +61,13 @@ def cmd_dtek_schedule(bot: TelegramBot, **kwargs) -> None:
     logger.info(f"{bot.chat_id}: Fetching DTEK schedule")
     bot.send_typing()
 
-    message, _ = run_monitor(city=settings.DTEK_CITY,
-                             street=settings.DTEK_STREET,
-                             building=settings.DTEK_BUILDING,
-                             state_file=settings.DTEK_STATE_FILE)
+    ctx = MonitorContext(city=settings.DTEK_CITY,
+                         street=settings.DTEK_STREET,
+                         building=settings.DTEK_BUILDING,
+                         state_file=Path(settings.DTEK_STATE_FILE),
+                         forced_group=None)
+
+    message, _ = MonitorService(ctx).run()
 
     bot.send_message(message)
 

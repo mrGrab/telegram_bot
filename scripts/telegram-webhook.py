@@ -17,16 +17,16 @@ class Webhook():
     def __init__(self, token):
         self.api_url = API_URL + token
 
-    def getWebhookInfo(self):
+    def get_webhook_info(self):
         url = self.api_url + "/getWebhookInfo"
         return self._send_request(url)
 
-    def deleteWebhook(self):
+    def delete_webhook(self):
         url = self.api_url + "/deleteWebhook"
         data = {"drop_pending_updates": True}
         return self._send_request(url, data=data)
 
-    def setWebhook(self, hook_url, allowed_updates, secret_token=""):
+    def set_webhook(self, hook_url, allowed_updates, secret_token=""):
         url = self.api_url + "/setWebhook"
         data = {
             "url": hook_url,
@@ -57,18 +57,18 @@ def cli(ctx, bot_token):
 @click.command()
 @click.pass_obj
 def info(wh):
-    info = wh.getWebhookInfo()
+    info = wh.get_webhook_info()
     print_json(data=info)
 
 
 @click.command()
 @click.pass_obj
 def delete(wh):
-    wh_url = wh.getWebhookInfo()["result"]["url"]
+    wh_url = wh.get_webhook_info()["result"]["url"]
     if click.confirm(f"Please confirm deleting {wh_url}",
                      default=False,
                      abort=True):
-        result = wh.deleteWebhook()
+        result = wh.delete_webhook()
         print_json(data=result)
 
 
@@ -82,7 +82,7 @@ def delete(wh):
               default="")
 @click.pass_obj
 def create(wh, url, max_connections, secret_token):
-    result = wh.setWebhook(url, max_connections, secret_token)
+    result = wh.set_webhook(url, max_connections, secret_token)
     print_json(data=result)
 
 

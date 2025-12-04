@@ -34,13 +34,16 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger(__name__)
 
 
+# ============================================================================
+# MODELS
+# ============================================================================
 class MonitorContext(BaseModel):
     """Holds configuration to avoid global variables"""
     city: str
     street: str
     building: str
     forced_group: Optional[str]
-    state_file: Path = Field(default=Path("last_state.json"))
+    state_file: Path
 
     @field_validator('city', mode='before')
     def parse_city(cls, city: str) -> str:
@@ -70,6 +73,14 @@ class OutagePeriod(BaseModel):
     def duration_minutes(self) -> int:
         return int((self.end - self.start).total_seconds() / 60)
 
+    def format_time_range(self) -> str:
+        """Format period as time range string"""
+        return f"{self.start.strftime('%H:%M')} - {self.end.strftime('%H:%M')}"
+
+    def get_icon(self) -> str:
+        """Get icon based on outage type"""
+        return "❔" if self.type == "maybe" else "❌"
+
 
 class DaySchedule(BaseModel):
     date: datetime
@@ -90,6 +101,10 @@ class DaySchedule(BaseModel):
             if 0 < time_until <= minutes_ahead:
                 return period.start
         return None
+
+    def format_date(self) -> str:
+        """Format date as weekday and date"""
+        return self.date.strftime("%a, %d.%m")
 
 
 class CurrentOutage(BaseModel):
@@ -124,6 +139,12 @@ class CurrentOutage(BaseModel):
         """Returns True if DTEK says the lights are currently out"""
         return bool(self.start_date and self.end_date)
 
+    def format_time_range(self) -> str:
+        """Format outage time range"""
+        if self.start_date and self.end_date:
+            return f"🕒 {self.start_date.strftime('%H:%M')} - {self.end_date.strftime('%H:%M')}"
+        return ""
+
     def __eq__(self, other) -> bool:
         """Compare two outage statuses"""
         if not isinstance(other, CurrentOutage):
@@ -134,6 +155,9 @@ class CurrentOutage(BaseModel):
                 and self.sub_type == other.sub_type)
 
 
+# ============================================================================
+# DATA FETCHER
+# ============================================================================
 class DTEKMonitor:
     """Monitors DTEK power outage information"""
 
@@ -213,7 +237,255 @@ class DTEKMonitor:
                 self.driver.quit()
 
 
+# ============================================================================
+# MESSAGE FORMATTER
+# ============================================================================
+class MessageFormatter:
+    """Handles all message formatting logic"""
+
+    def __init__(self, ctx: MonitorContext):
+        self.ctx = ctx
+
+    def format_header(self, outage: CurrentOutage) -> List[str]:
+        """Generate header section with location and group info"""
+        lines = []
+        lines.append(f"📍 <b>{self.ctx.city.replace('+', ' ')}, "
+                     f"{self.ctx.street.replace('+', ' ')}, "
+                     f"{self.ctx.building}</b>")
+
+        group = self.ctx.forced_group or outage.group
+        if group:
+            lines.append(f"  Черга: <b>{group}</b>")
+
+        return lines
+
+    def format_alert_status(self, outage: CurrentOutage,
+                            upcoming: Optional[datetime]) -> List[str]:
+        """Generate alert section for active outages or upcoming warnings"""
+        lines = []
+
+        if outage.is_active:
+            lines.append("\n🔴 <b>Світло відсутнє!</b>")
+        elif upcoming:
+            mins = int((upcoming - datetime.now()).total_seconds() / 60)
+            lines.append(f"\n⚠️ <b>Увага! Відключення через {mins} хв</b>")
+
+        return lines
+
+    def format_current_status(self, outage: CurrentOutage) -> List[str]:
+        """Generate current outage status section"""
+        lines = ["\n📌 <b>Поточне відключення</b>"]
+
+        if outage.is_active:
+            if outage.sub_type:
+                lines.append(f"{outage.sub_type}")
+            time_range = outage.format_time_range()
+            if time_range:
+                lines.append(time_range)
+        else:
+            lines.append("✅ Зараз відключень немає")
+
+        if outage.updated_at:
+            lines.append(
+                f"<i>Оновлено:</i> {outage.updated_at.strftime('%H:%M')}")
+
+        return lines
+
+    def format_schedule(self, schedules: List[DaySchedule]) -> List[str]:
+        """Generate schedule section with daily outage periods"""
+        lines = ["\n📅 <b>Графік відключень</b>"]
+
+        if not schedules:
+            lines.append("🔋 Без відключень")
+            return lines
+
+        for day in schedules:
+            lines.append(f"<b>{day.format_date()}</b>:")
+
+            if not day.periods:
+                lines.append("  🔋 Без відключень")
+            else:
+                for period in day.periods:
+                    lines.append(
+                        f"  {period.get_icon()} {period.format_time_range()}")
+
+        if schedules and schedules[0].updated_at:
+            lines.append(
+                f"<i>Графік оновлено:</i> {schedules[0].updated_at.strftime('%H:%M')}"
+            )
+
+        return lines
+
+    def generate_report(self, outage: CurrentOutage,
+                        schedules: List[DaySchedule],
+                        upcoming: Optional[datetime]) -> str:
+        """Generate complete human-readable report"""
+        lines = []
+
+        lines.extend(self.format_header(outage))
+        lines.extend(self.format_alert_status(outage, upcoming))
+        lines.extend(self.format_current_status(outage))
+        lines.extend(self.format_schedule(schedules))
+
+        return "\n".join(lines)
+
+
+# ============================================================================
+# SCHEDULE PARSER
+# ============================================================================
+class DayScheduleParser:
+    """Parses schedule for a single day"""
+
+    def __init__(self, base_date: datetime, hours_map: Dict[str, str],
+                 updated_at: Optional[datetime]):
+        self.base_date = base_date
+        self.hours_map = hours_map
+        self.updated_at = updated_at
+        self.periods: List[OutagePeriod] = []
+        self.current_period_start: Optional[datetime] = None
+        self.current_period_type: str = "yes"
+
+    def parse(self) -> DaySchedule:
+        """Parse all hours for this day"""
+        sorted_hours = sorted([int(k) for k in self.hours_map.keys()])
+
+        for hour in sorted_hours:
+            status = TimeType(self.hours_map[str(hour)])
+            self._process_hour(hour, status)
+
+        self._finalize_periods()
+
+        return DaySchedule(date=self.base_date,
+                           periods=self.periods,
+                           updated_at=self.updated_at)
+
+    def _process_hour(self, hour: int, status: TimeType):
+        """Process a single hour based on its status"""
+
+        # Determine start and end of this specific hour slot
+        slot_start = self._create_time(hour - 1, 0)
+        slot_mid = self._create_time(hour - 1, 30)
+
+        # Handle full hour outage (NO or MAYBE)
+        if status in [TimeType.NO, TimeType.MAYBE]:
+            outage_type = status.value
+            if self.current_period_start is None:
+                self.current_period_start = slot_start
+                self.current_period_type = outage_type
+
+        # Handle first half hour outage (FIRST or MFIRST)
+        elif status in [TimeType.FIRST, TimeType.MFIRST]:
+            outage_type = "maybe" if status == TimeType.MFIRST else "no"
+            if self.current_period_start is None:
+                self.current_period_start = slot_start
+                self.current_period_type = outage_type
+
+            self._add_period(start=self.current_period_start,
+                             end=slot_mid,
+                             outage_type=self.current_period_type)
+            self.current_period_start = None
+
+        # Handle second half hour outage (SECOND or MSECOND)
+        elif status in [TimeType.SECOND, TimeType.MSECOND]:
+            outage_type = "maybe" if status == TimeType.MSECOND else "no"
+            if self.current_period_start:
+                self._add_period(start=self.current_period_start,
+                                 end=slot_start,
+                                 outage_type=self.current_period_type)
+            self.current_period_start = slot_mid
+            self.current_period_type = outage_type
+
+        # End the current outage period
+        else:  # YES (Power ON)
+            if self.current_period_start:
+                self._add_period(start=self.current_period_start,
+                                 end=slot_start,
+                                 outage_type=self.current_period_type)
+                self.current_period_start = None
+
+    def _finalize_periods(self):
+        """Finalize any remaining period at end of day"""
+        if self.current_period_start:
+            final_end = self._create_time(24, 0)
+            self._add_period(start=self.current_period_start,
+                             end=final_end,
+                             outage_type=self.current_period_type)
+
+    def _add_period(self, start: datetime, end: datetime, outage_type: str):
+        """Add an outage period to the list"""
+        self.periods.append(
+            OutagePeriod(start=start, end=end, type=outage_type))
+
+    def _create_time(self, hour: int, minute: int) -> datetime:
+        """Create datetime handling special cases like hour=24"""
+        if hour == 24:
+            return (self.base_date + timedelta(days=1)).replace(hour=0,
+                                                                minute=minute,
+                                                                second=0,
+                                                                microsecond=0)
+        if hour == -1:
+            return (self.base_date - timedelta(days=1)).replace(hour=23,
+                                                                minute=minute,
+                                                                second=0,
+                                                                microsecond=0)
+        return self.base_date.replace(hour=hour,
+                                      minute=minute,
+                                      second=0,
+                                      microsecond=0)
+
+
+class ScheduleParser:
+    """Handles parsing of schedule data from DTEK API"""
+
+    def __init__(self, data: Optional[Dict], group: Optional[str]):
+        self.data = data
+        self.group = group
+        self.updated_at = self._parse_update_timestamp()
+
+    def _parse_update_timestamp(self) -> Optional[datetime]:
+        """Parse the update timestamp from schedule data"""
+        if not self.data or not self.data.get("update"):
+            return None
+        try:
+            # DTEK timestamp format: d.m.Y H:M
+            return datetime.strptime(self.data["update"], "%d.%m.%Y %H:%M")
+        except ValueError:
+            return None
+
+    def parse(self) -> List[DaySchedule]:
+        """Parse schedule data for the configured group"""
+        if not self.data or "data" not in self.data or not self.group:
+            logger.warning(
+                "Cannot parse schedule: missing data or missing group")
+            return []
+
+        group_key = f"GPV{self.group}"
+        schedules = []
+
+        for timestamp, groups_data in self.data["data"].items():
+            if group_key not in groups_data:
+                logger.warning(f"No data for group {group_key} on {timestamp}")
+                continue
+            try:
+                base_date = datetime.fromtimestamp(int(timestamp))
+                hours_map = groups_data[group_key]
+
+                day_parser = DayScheduleParser(base_date, hours_map,
+                                               self.updated_at)
+                schedule = day_parser.parse()
+                schedules.append(schedule)
+            except Exception as e:
+                logger.error(f"Error parsing schedule for {timestamp}: {e}")
+                continue
+
+        return schedules
+
+
+# ============================================================================
+# STATE MANAGEMENT
+# ============================================================================
 class StateManager:
+    """Manages persistent state storage"""
 
     @staticmethod
     def load(file_path: Path) -> Dict[str, Any]:
@@ -248,10 +520,91 @@ class StateManager:
             logger.error(f"Failed to save state: {e}")
 
 
+# ============================================================================
+# MONITOR SERVICE
+# ============================================================================
+class MonitorService:
+    """Main monitoring service orchestrator"""
+
+    def __init__(self, ctx: MonitorContext):
+        self.ctx = ctx
+        self.formatter = MessageFormatter(ctx)
+        self.schedules: List[DaySchedule] = []
+        self.outage: Optional[CurrentOutage] = None
+        self.notify_threshold: int = 25
+        self.upcoming: Optional[datetime] = None
+
+    def should_notify(self) -> Tuple[bool, str]:
+        """Check if notification should be sent"""
+
+        # Check upcoming outage
+        self.upcoming = None
+        for day in self.schedules:
+            check = day.get_upcoming_outage(self.notify_threshold)
+            if check:
+                self.upcoming = check
+                logger.info("Upcoming outage warning triggered")
+                return True, ""
+
+        # Load previous state for comparison
+        last = StateManager.load(self.ctx.state_file)
+        last_outage = CurrentOutage(**last["outage"])
+        last_schedule = last["schedule_periods"]
+
+        #Current outage status change
+        if last_outage != self.outage:
+            logger.info("Current outage status changed. Notifying")
+            return True, "<code>ЗМІНА ВІДКЛЮЧЕННЯ</code>\n\n"
+
+        # Check schedule change
+        new_schedule = get_schedule_periods_json(self.schedules)
+        if new_schedule != last_schedule:
+            logger.info("Schedule plan changed. Notifying")
+            return True, "<code>ЗМІНА ГРАФІКА</code>\n\n"
+
+        return False, ""
+
+    def run(self) -> Tuple[str, bool]:
+        """Execute monitoring logic"""
+        # Fetch data
+        outage_data, schedule_data = DTEKMonitor().fetch(
+            city=self.ctx.city, street=self.ctx.street)
+
+        if not outage_data:
+            return "❌ Помилка отримання даних про відключення", True
+
+        # Parse data
+        self.outage = parse_current_outage(outage_data, self.ctx.building)
+        group = self.ctx.forced_group or self.outage.group
+
+        # Parse schedule
+        parser = ScheduleParser(schedule_data, group)
+        self.schedules = parser.parse()
+
+        # Evaluate changes
+        should_notify, header = self.should_notify()
+
+        # Save new state
+        new_schedule_periods = get_schedule_periods_json(self.schedules)
+        StateManager.save(file_path=self.ctx.state_file,
+                          outage=self.outage,
+                          schedule_periods=new_schedule_periods)
+
+        # Generate report
+        message = self.formatter.generate_report(outage=self.outage,
+                                                 schedules=self.schedules,
+                                                 upcoming=self.upcoming)
+        return header + message, should_notify
+
+
+# ============================================================================
+# UTILITIES
+# ============================================================================
 def parse_current_outage(data: Dict, building: str) -> CurrentOutage:
     """Parse raw outage data"""
 
     if not data or not data.get("result"):
+        logger.warning("No outage data result found")
         return CurrentOutage()
 
     raw_data = data.get("data", {})
@@ -270,115 +623,6 @@ def parse_current_outage(data: Dict, building: str) -> CurrentOutage:
                          end_date=item.get("end_date"),
                          group=group,
                          updated_at=data.get("updateTimestamp"))
-
-
-def _safe_time_create(base_date: datetime, hour: int, minute: int) -> datetime:
-    """
-    Handles hour=24 by moving to the next day at 00:00
-    """
-    if hour == 24:
-        return (base_date + timedelta(days=1)).replace(hour=0,
-                                                       minute=minute,
-                                                       second=0,
-                                                       microsecond=0)
-    if hour == -1:
-        return (base_date - timedelta(days=1)).replace(hour=23,
-                                                       minute=minute,
-                                                       second=0,
-                                                       microsecond=0)
-    return base_date.replace(hour=hour, minute=minute, second=0, microsecond=0)
-
-
-def parse_schedule_for_group(data: Optional[Dict],
-                             group: Optional[str]) -> List[DaySchedule]:
-    """Parse raw schedule data"""
-
-    if not data or "data" not in data or not group:
-        return []
-
-    group_key = f"GPV{group}"
-    results = []
-
-    updated_at = None
-    if data.get("update"):
-        try:
-            updated_at = datetime.strptime(data["update"], "%d.%m.%Y %H:%M")
-        except ValueError:
-            pass
-
-    # Iterate over days
-    for timestamp, groups_data in data["data"].items():
-
-        if group_key not in groups_data:
-            logger.warning(f"No data for group {group_key} on {timestamp}")
-            continue
-
-        base_date = datetime.fromtimestamp(int(timestamp))
-        hours_map = groups_data[group_key]
-        sorted_hours = sorted([int(k) for k in hours_map.keys()])
-
-        # Build outage periods
-        periods = []
-        current_period_start = None
-        current_period_type = "yes"
-
-        for h in sorted_hours:
-            status = TimeType(hours_map[str(h)])
-
-            # Determine start and end of this specific hour slot
-            slot_start = _safe_time_create(base_date, h - 1, 0)
-            slot_mid = _safe_time_create(base_date, h - 1, 30)
-
-            p_type = "no"
-
-            # Check if this hour contains an outage
-            if status in [TimeType.NO, TimeType.MAYBE]:
-                p_type = status.value
-                if current_period_start is None:
-                    current_period_start = slot_start
-                    current_period_type = p_type
-            elif status in [TimeType.FIRST, TimeType.MFIRST]:
-                # First half is outage
-                p_type = "maybe" if status == TimeType.MFIRST else "no"
-                if current_period_start is None:
-                    current_period_start = slot_start
-                periods.append(
-                    OutagePeriod(start=current_period_start,
-                                 end=slot_mid,
-                                 type=p_type))
-                current_period_start = None
-
-            elif status in [TimeType.SECOND, TimeType.MSECOND]:
-                # Second half is outage
-                p_type = "maybe" if status == TimeType.MSECOND else "no"
-                if current_period_start:
-                    periods.append(
-                        OutagePeriod(start=current_period_start,
-                                     end=slot_start,
-                                     type=current_period_type))
-                current_period_start = slot_mid
-                current_period_type = p_type
-            else:  # YES (Power ON)
-                if current_period_start:
-                    periods.append(
-                        OutagePeriod(start=current_period_start,
-                                     end=slot_start,
-                                     type=current_period_type))
-                    current_period_start = None
-
-        # End of day cleanup
-        if current_period_start:
-            final_end = _safe_time_create(base_date, 24, 0)
-            periods.append(
-                OutagePeriod(start=current_period_start,
-                             end=final_end,
-                             type=current_period_type))
-
-        results.append(
-            DaySchedule(date=base_date, periods=periods,
-                        updated_at=updated_at))
-
-    return results
 
 
 def get_schedule_periods_json(schedules: List[DaySchedule]) -> str:
@@ -400,135 +644,17 @@ def get_schedule_periods_json(schedules: List[DaySchedule]) -> str:
     return json.dumps(data, sort_keys=True, ensure_ascii=False)
 
 
-def generate_text_report(ctx: MonitorContext, outage: CurrentOutage,
-                         schedules: List[DaySchedule],
-                         upcoming: Optional[datetime]) -> str:
-    """Generate human-readable report"""
-    lines = []
-
-    # Header — location
-    lines.append(f"📍 <b>{ctx.city.replace('+', ' ')}, "
-                 f"{ctx.street.replace('+', ' ')}, "
-                 f"{ctx.building}</b>")
-
-    if ctx.forced_group or outage.group:
-        lines.append(f"  Черга: <b>{ctx.forced_group or outage.group}</b>")
-
-    # Status
-    if outage.is_active:
-        lines.append("\n🔴 <b>Світло відсутнє!</b>")
-    elif upcoming:
-        mins = int((upcoming - datetime.now()).total_seconds() / 60)
-        lines.append(f"\n⚠️ <b>Увага! Відключення через {mins} хв</b>")
-
-    # Current status
-    lines.append("\n📌 <b>Поточне відключення</b>")
-    if outage.is_active:
-        lines.append(f"{outage.sub_type}")
-        if outage.start_date and outage.end_date:
-            lines.append(
-                f"🕒 {outage.start_date.strftime('%H:%M')} - {outage.end_date.strftime('%H:%M')}"
-            )
-    else:
-        lines.append("✅ Зараз відключень немає")
-    if outage.updated_at:
-        lines.append(f"<i>Оновлено:</i> {outage.updated_at.strftime('%H:%M')}")
-
-    lines.append("\n📅 <b>Графік відключень</b>")
-    if schedules:
-        for day in schedules:
-            date_str = day.date.strftime("%a, %d.%m")
-            lines.append(f"<b>{date_str}</b>:")
-
-            if not day.periods:
-                lines.append("  🔋 Без відключень")
-            else:
-                for p in day.periods:
-                    icon = "❔" if p.type == "maybe" else "❌"
-                    lines.append(
-                        f"  {icon} {p.start.strftime('%H:%M')} - {p.end.strftime('%H:%M')}"
-                    )
-    else:
-        lines.append("🔋 Без відключень")
-
-    if schedules and schedules[0].updated_at:
-        lines.append(
-            f"<i>Графік оновлено:</i> {schedules[0].updated_at.strftime('%H:%M')}"
-        )
-
-    return "\n".join(lines)
-
-
 def send_telegram_notification(token: str, chat_ids: Tuple[str], message: str):
     """Sends message to multiple chats using requests"""
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     for chat_id in chat_ids:
         try:
             data = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
-            requests.post(url, data=data, timeout=5)
+            r = requests.post(url, data=data, timeout=5)
+            r.raise_for_status()
             logger.info(f"Notification sent to {chat_id}")
         except Exception as e:
             logger.error(f"Failed to send to {chat_id}: {e}")
-
-
-def run_monitor(city: str,
-                street: str,
-                building: str,
-                forced_group: Optional[str] = None,
-                state_file: str = "last_state.json",
-                notify_threshold: int = 25) -> Tuple[str, bool]:
-    """Main monitor logic"""
-
-    ctx = MonitorContext(city=city,
-                         street=street,
-                         building=building,
-                         forced_group=forced_group,
-                         state_file=Path(state_file))
-
-    monitor = DTEKMonitor()
-    outage_data, schedule_data = monitor.fetch(city=ctx.city,
-                                               street=ctx.street)
-    if not outage_data:
-        return "❌ Помилка отримання даних про відключення", True
-
-    outage = parse_current_outage(outage_data, ctx.building)
-    group = forced_group or outage.group
-    schedules = parse_schedule_for_group(schedule_data, group)
-
-    new_schedule_periods = get_schedule_periods_json(schedules)
-    should_notify = False
-
-    # Load previous state
-    last = StateManager.load(ctx.state_file)
-    last_outage = CurrentOutage(**last["outage"])
-    last_schedule = last["schedule_periods"]
-
-    # Check if schedule changed
-    if last_outage != outage:
-        logger.info("Current outage status changed")
-        should_notify = True
-
-    # Schedule Change
-    if new_schedule_periods != last_schedule:
-        logger.info("Schedule plan changed")
-        should_notify = True
-
-    # Upcoming Outage Warning
-    upcoming = None
-    for day in schedules:
-        check = day.get_upcoming_outage(notify_threshold)
-        if check:
-            upcoming = check
-            logger.info("Upcoming outage warning")
-            should_notify = True
-            break
-
-    # Save state
-    StateManager.save(ctx.state_file, outage, new_schedule_periods)
-
-    # Generate report
-    final_msg = generate_text_report(ctx, outage, schedules, upcoming)
-    return final_msg, should_notify
 
 
 @click.command()
@@ -565,12 +691,17 @@ def main(city, street, building, forced_group, telegram_token, chat_id,
     if not state_file:
         state_file = "last_state.json"
 
-    message, should_notify = run_monitor(city=city,
-                                         street=street,
-                                         building=building,
-                                         forced_group=forced_group,
-                                         state_file=state_file,
-                                         notify_threshold=25)
+    # Create context
+    ctx = MonitorContext(city=city,
+                         street=street,
+                         building=building,
+                         forced_group=forced_group,
+                         state_file=Path(state_file))
+
+    # Run monitoring
+    service = MonitorService(ctx)
+    service.notify_threshold = 25
+    message, should_notify = service.run()
 
     if output == 'html':
         print(message)
