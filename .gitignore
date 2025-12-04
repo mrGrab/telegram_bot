@@ -11,6 +11,5 @@ wheels/
 
 .env
 last_state.json
-.python-version
 uv.lock
 tests
