@@ -174,9 +174,6 @@ class CurrentOutage(BaseModel):
 class DTEKMonitor:
     """Monitors DTEK power outage information"""
 
-    def __init__(self):
-        pass
-
     def _init_driver(self):
         """Configure and return Chrome WebDriver"""
         options = Options()

@@ -49,7 +49,7 @@ def check_connection(host: str, port: int, timeout: int) -> int:
         return 0
 
     except OSError as e:
-        logger.error(f"Connection failed. Error: {e}")
+        logger.exception(f"Connection failed. Error: {e}")
         return 1
 
 

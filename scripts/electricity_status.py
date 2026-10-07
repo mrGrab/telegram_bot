@@ -102,13 +102,34 @@ class ElectricityChecker:
         if isinstance(issued, bool) or not isinstance(issued, int) or issued <= 0:
             return ElectricityOutcome(ElectricityStatus.UNKNOWN, "invalid_response")
 
+        return self._poll_result(issued)
+
+    @staticmethod
+    def _event_outcome(
+        event: object, issued: int
+    ) -> tuple[ElectricityOutcome | None, bool]:
+        """Return a fresh outcome, or whether the event is malformed."""
+        if not isinstance(event, dict) or not isinstance(event.get("check"), dict):
+            return None, True
+        check = event["check"]
+        event_issued = check.get("issued")
+        if isinstance(event_issued, bool) or not isinstance(event_issued, int):
+            return None, True
+        if event_issued != issued:
+            return None, False
+
+        status = check.get("status")
+        if isinstance(status, bool) or not isinstance(status, int):
+            return None, True
+        if status in (0, 1, 2):
+            return ElectricityOutcome(ElectricityStatus(status), "completed"), False
+        return ElectricityOutcome(ElectricityStatus.UNKNOWN, "check_unknown"), False
+
+    def _poll_result(self, issued: int) -> ElectricityOutcome:
         deadline = self.clock() + MAX_WAIT_SECONDS
         saw_invalid = False
         saw_response = False
-        while True:
-            remaining = deadline - self.clock()
-            if remaining <= 0:
-                break
+        while (remaining := deadline - self.clock()) > 0:
             try:
                 event = self.sensu.get_event_check(
                     self.check_name, self.entity_name, timeout=min(10, remaining)
@@ -120,40 +141,20 @@ class ElectricityChecker:
                 break
             if event is not None:
                 saw_response = True
-                if not isinstance(event, dict) or not isinstance(
-                    event.get("check"), dict
-                ):
-                    saw_invalid = True
-                else:
-                    check = event["check"]
-                    event_issued = check.get("issued")
-                    if isinstance(event_issued, bool) or not isinstance(
-                        event_issued, int
-                    ):
-                        saw_invalid = True
-                    elif event_issued == issued:
-                        status = check.get("status")
-                        if isinstance(status, bool) or not isinstance(status, int):
-                            saw_invalid = True
-                        elif status in (0, 1, 2):
-                            return ElectricityOutcome(
-                                ElectricityStatus(status), "completed"
-                            )
-                        else:
-                            return ElectricityOutcome(
-                                ElectricityStatus.UNKNOWN, "check_unknown"
-                            )
+                outcome, invalid = self._event_outcome(event, issued)
+                saw_invalid = saw_invalid or invalid
+                if outcome is not None:
+                    return outcome
             remaining = deadline - self.clock()
             if remaining > 0:
                 self.sleep(min(POLL_INTERVAL_SECONDS, remaining))
 
-        reason = (
-            "invalid_response"
-            if saw_invalid
-            else "timed_out"
-            if saw_response
-            else "fetch_failed"
-        )
+        if saw_invalid:
+            reason = "invalid_response"
+        elif saw_response:
+            reason = "timed_out"
+        else:
+            reason = "fetch_failed"
         logger.warning("No fresh electricity result: %s", reason)
         return ElectricityOutcome(ElectricityStatus.UNKNOWN, reason)
 
