@@ -204,8 +204,8 @@ class DTEKMonitor:
         if match:
             try:
                 return json.loads(match.group(1))
-            except json.JSONDecodeError as e:
-                logger.error(f"Failed to parse schedule JSON: {e}")
+            except json.JSONDecodeError:
+                logger.exception("Failed to parse schedule JSON")
         return None
 
     def fetch(self, city: str, street: str) -> tuple[dict | None, dict | None]:
@@ -255,8 +255,8 @@ class DTEKMonitor:
             )
             return outage_json, schedule_json
 
-        except WebDriverException as e:
-            logger.error(f"Browser error: {e}")
+        except WebDriverException:
+            logger.exception("Browser error")
             return None, None
         finally:
             if driver:
@@ -408,20 +408,15 @@ class DayScheduleParser:
 
         # Handle full hour outage (NO or MAYBE)
         if status in [TimeType.NO, TimeType.MAYBE]:
-            outage_type = status.value
-            if self.current_period_start is None:
-                self.current_period_start = slot_start
-                self.current_period_type = outage_type
+            self._start_period_if_needed(slot_start, status.value)
 
         # Handle first half hour outage (FIRST or MFIRST)
         elif status in [TimeType.FIRST, TimeType.MFIRST]:
             outage_type = "maybe" if status == TimeType.MFIRST else "no"
-            if self.current_period_start is None:
-                self.current_period_start = slot_start
-                self.current_period_type = outage_type
+            period_start = self._start_period_if_needed(slot_start, outage_type)
 
             self._add_period(
-                start=self.current_period_start,
+                start=period_start,
                 end=slot_mid,
                 outage_type=self.current_period_type,
             )
@@ -448,6 +443,13 @@ class DayScheduleParser:
                     outage_type=self.current_period_type,
                 )
                 self.current_period_start = None
+
+    def _start_period_if_needed(self, start: datetime, outage_type: str) -> datetime:
+        if self.current_period_start is None:
+            self.current_period_start = start
+            self.current_period_type = outage_type
+            return start
+        return self.current_period_start
 
     def _finalize_periods(self):
         """Finalize any remaining period at end of day"""
@@ -496,27 +498,27 @@ class ScheduleParser:
         except TypeError, ValueError:
             return None
 
-    def parse(self) -> list[DaySchedule]:
-        """Parse schedule data for the configured group"""
+    def _schedule_pairs(self) -> list[tuple[object, object]]:
+        """Normalize the old and new API schedule formats."""
         if not isinstance(self.data, dict) or "data" not in self.data:
             raise ValueError("Schedule data is missing")
 
         raw = self.data["data"]
 
-        # API may return a dict {timestamp: groups_data} (old) or a list (new).
-        # Normalise to an iterable of (timestamp, groups_data) pairs.
         if isinstance(raw, dict):
-            pairs = list(raw.items())
-        elif isinstance(raw, list):
-            # Each item is expected to be a single-key dict: {timestamp: groups_data}
+            return list(raw.items())
+        if isinstance(raw, list):
             pairs = []
             for item in raw:
                 if not isinstance(item, dict) or not item:
                     raise ValueError("Schedule day data is invalid")
                 pairs.extend(item.items())
-        else:
-            raise TypeError(f"Unexpected schedule data type: {type(raw).__name__}")
+            return pairs
+        raise TypeError(f"Unexpected schedule data type: {type(raw).__name__}")
 
+    def parse(self) -> list[DaySchedule]:
+        """Parse schedule data for the configured group"""
+        pairs = self._schedule_pairs()
         if not pairs:
             return []
         if not self.group:
@@ -529,6 +531,8 @@ class ScheduleParser:
             try:
                 if not isinstance(groups_data, dict) or group_key not in groups_data:
                     raise ValueError(f"No data for group {group_key}")
+                if not isinstance(timestamp, (str, int, float)):
+                    raise TypeError("Schedule timestamp is invalid")
                 base_date = datetime.fromtimestamp(int(timestamp), tz=DTEK_TIMEZONE)
                 hours_map = groups_data[group_key]
 
@@ -581,8 +585,8 @@ class StateManager:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(temporary_path, file_path)
-        except Exception as e:
-            logger.error(f"Failed to save state: {e}")
+        except Exception:
+            logger.exception("Failed to save state")
             raise
         finally:
             if temporary_path and temporary_path.exists():
@@ -668,8 +672,8 @@ class MonitorService:
                 message=message,
                 observed_at=now,
             ), ""
-        except (ValueError, TypeError, WebDriverException) as e:
-            logger.error(f"DTEK observation failed: {e}")
+        except ValueError, TypeError, WebDriverException:
+            logger.exception("DTEK observation failed")
             return None, "❌ Помилка отримання графіка відключень"
 
     def report(self) -> str:
@@ -706,8 +710,8 @@ class MonitorService:
     ) -> bool:
         try:
             return bool(send(chat_id, message))
-        except requests.RequestException as e:
-            logger.error(f"Failed to send DTEK alert to {chat_id}: {e}")
+        except requests.RequestException:
+            logger.exception("Failed to send DTEK alert to %s", chat_id)
             return False
 
     def _notify_failure(
@@ -740,19 +744,13 @@ class MonitorService:
         cutoff = (observation.observed_at - timedelta(days=1)).isoformat()
         for chat_id in dict.fromkeys(chat_ids):
             previous = state.chats.get(chat_id)
-            reasons = []
-            if previous is None:
-                reasons.append("ПОЧАТКОВИЙ ЗВІТ")
-            else:
-                if previous.outage != observation.outage:
-                    reasons.append("ЗМІНА ВІДКЛЮЧЕННЯ")
-                if previous.schedule_periods != observation.schedule_periods:
-                    reasons.append("ЗМІНА ГРАФІКА")
+            reasons = self._report_reasons(
+                previous,
+                observation,
+                upcoming_keys,
+                chat_id in state.recovery_pending,
+            )
             warned = previous.warned_starts if previous else set()
-            if upcoming_keys - warned:
-                reasons.append("НАБЛИЖАЄТЬСЯ ВІДКЛЮЧЕННЯ")
-            if chat_id in state.recovery_pending:
-                reasons.append("МОНІТОРИНГ ВІДНОВЛЕНО")
             if not reasons:
                 continue
             headers = "\n".join(f"<code>{reason}</code>" for reason in reasons)
@@ -766,6 +764,28 @@ class MonitorService:
                 )
                 state.recovery_pending.discard(chat_id)
                 self.state.save(self.ctx.state_file, state)
+
+    @staticmethod
+    def _report_reasons(
+        previous: ChatState | None,
+        observation: Observation,
+        upcoming_keys: set[str],
+        recovering: bool,
+    ) -> list[str]:
+        reasons = []
+        if previous is None:
+            reasons.append("ПОЧАТКОВИЙ ЗВІТ")
+        else:
+            if previous.outage != observation.outage:
+                reasons.append("ЗМІНА ВІДКЛЮЧЕННЯ")
+            if previous.schedule_periods != observation.schedule_periods:
+                reasons.append("ЗМІНА ГРАФІКА")
+        warned = previous.warned_starts if previous else set()
+        if upcoming_keys - warned:
+            reasons.append("НАБЛИЖАЄТЬСЯ ВІДКЛЮЧЕННЯ")
+        if recovering:
+            reasons.append("МОНІТОРИНГ ВІДНОВЛЕНО")
+        return reasons
 
 
 # ============================================================================
@@ -830,8 +850,8 @@ def send_telegram_notification(token: str, chat_id: str, message: str) -> bool:
             raise ValueError("Telegram did not accept the message")
         logger.info(f"Notification sent to {chat_id}")
         return True
-    except (requests.RequestException, ValueError) as e:
-        logger.error(f"Failed to send to {chat_id}: {e}")
+    except requests.RequestException, ValueError:
+        logger.exception("Failed to send to %s", chat_id)
         return False
 
 

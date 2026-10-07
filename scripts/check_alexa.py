@@ -2,6 +2,24 @@ import logging
 import socket
 import sys
 
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class AlexaTarget(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        env_ignore_empty=True,
+        case_sensitive=True,
+        extra="ignore",
+    )
+
+    ALEXA_HOST: str = "127.0.0.1"
+    ALEXA_PORT: int = 80
+
+
+target = AlexaTarget()
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -12,14 +30,20 @@ logger = logging.getLogger(__name__)
 
 
 def check_connection(host: str, port: int, timeout: int) -> int:
-    """Performs socket check, and exits with status"""
+    """Check only the configured Alexa endpoint."""
 
-    logger.info(f"Attempting socket connection to {host}:{port}")
+    if (host, port) != (target.ALEXA_HOST, target.ALEXA_PORT):
+        logger.error("Connection target is not the configured Alexa endpoint")
+        return 1
+
+    logger.info(
+        f"Attempting socket connection to {target.ALEXA_HOST}:{target.ALEXA_PORT}"
+    )
 
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(timeout)
-            s.connect((host, port))
+            s.connect((target.ALEXA_HOST, target.ALEXA_PORT))
 
         logger.info("Connection successful")
         return 0
