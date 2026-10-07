@@ -149,14 +149,17 @@ class ElectricityChecker:
             if remaining > 0:
                 self.sleep(min(POLL_INTERVAL_SECONDS, remaining))
 
-        if saw_invalid:
-            reason = "invalid_response"
-        elif saw_response:
-            reason = "timed_out"
-        else:
-            reason = "fetch_failed"
+        reason = self._poll_failure_reason(saw_invalid, saw_response)
         logger.warning("No fresh electricity result: %s", reason)
         return ElectricityOutcome(ElectricityStatus.UNKNOWN, reason)
+
+    @staticmethod
+    def _poll_failure_reason(saw_invalid: bool, saw_response: bool) -> str:
+        if saw_invalid:
+            return "invalid_response"
+        if saw_response:
+            return "timed_out"
+        return "fetch_failed"
 
 
 @click.command()
