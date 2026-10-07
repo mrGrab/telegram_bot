@@ -1,5 +1,5 @@
 import requests
-from typing import Optional
+
 from core.logger import logger
 
 
@@ -10,7 +10,7 @@ class TelegramBot:
 
     def __init__(self, token: str):
         self.api_url = f"https://api.telegram.org/bot{token}"
-        self.chat_id: Optional[int] = None
+        self.chat_id: int | None = None
         logger.debug("TelegramBot initialized")
 
     def send_message(self, message: str):
@@ -25,8 +25,7 @@ class TelegramBot:
         try:
             r = requests.post(url, data=data, timeout=5)
             r.raise_for_status()
-            logger.info(
-                f"{self.chat_id}: Message has been sent: {r.status_code}")
+            logger.info(f"{self.chat_id}: Message has been sent: {r.status_code}")
         except requests.exceptions.RequestException as e:
             logger.error(f"{self.chat_id}: Failed to send message: {e}")
 
@@ -44,5 +43,4 @@ class TelegramBot:
             r.raise_for_status()
             logger.debug(f"{self.chat_id}: Typing action has been sent")
         except requests.exceptions.RequestException as e:
-            logger.error(
-                f"{self.chat_id}: Failed to send typing action. Error: {e}")
+            logger.error(f"{self.chat_id}: Failed to send typing action. Error: {e}")

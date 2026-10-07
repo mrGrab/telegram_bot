@@ -10,5 +10,4 @@ wheels/
 
 .env
 last_state.json
-uv.lock
-tests
+tests/*.json

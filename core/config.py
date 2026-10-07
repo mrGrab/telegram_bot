@@ -1,6 +1,8 @@
 # telegram_bot/config.py
 import sys
-from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from pydantic import Field, ValidationError
+from pydantic_settings import BaseSettings, SettingsConfigDict, SettingsError
 
 
 class Settings(BaseSettings):
@@ -8,14 +10,21 @@ class Settings(BaseSettings):
     Application settings loaded from .env or environment variables
     """
 
-    model_config = SettingsConfigDict(env_file=".env",
-                                      env_file_encoding="utf-8",
-                                      env_ignore_empty=True,
-                                      case_sensitive=True,
-                                      extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        env_ignore_empty=True,
+        hide_input_in_errors=True,
+        case_sensitive=True,
+        extra="ignore",
+    )
 
     # Core settings
     BOT_TOKEN: str
+    TELEGRAM_WEBHOOK_SECRET: str = Field(
+        min_length=1, max_length=256, pattern=r"^[A-Za-z0-9_-]+$"
+    )
+    TELEGRAM_ALLOWED_CHAT_IDS: set[int] = Field(min_length=1)
 
     # Sensu settings
     SENSU_API_URL: str
@@ -43,7 +52,7 @@ class Settings(BaseSettings):
 
 try:
     settings = Settings()
-except Exception as e:
+except (ValidationError, SettingsError, OSError, UnicodeError) as e:
     print("ERROR: Failed to load settings. Ensure required variables are set")
-    print(f"Pydantic Error: {e}")
+    print(f"Settings error: {e}")
     sys.exit(1)

@@ -1,11 +1,13 @@
-import sys
-import socket
 import logging
+import socket
+import sys
 
 # Configure logging
-logging.basicConfig(level=logging.INFO,
-                    format="[%(levelname)s] %(message)s",
-                    handlers=[logging.StreamHandler()])
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler()],
+)
 logger = logging.getLogger(__name__)
 
 
@@ -22,7 +24,7 @@ def check_connection(host: str, port: int, timeout: int) -> int:
         logger.info("Connection successful")
         return 0
 
-    except Exception as e:
+    except OSError as e:
         logger.error(f"Connection failed. Error: {e}")
         return 1
 
@@ -49,5 +51,5 @@ def main() -> int:
     return check_connection(host, port, timeout)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     sys.exit(main())
