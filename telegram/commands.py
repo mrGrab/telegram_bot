@@ -3,9 +3,9 @@ from pathlib import Path
 
 from core.config import settings
 from core.logger import logger
-from scripts.check_alexa import check_connection
-from scripts.dtek_monitor import MonitorContext, MonitorService
-from scripts.electricity_status import ElectricityStatus
+from services.alexa import check_connection
+from services.dtek_monitor import MonitorContext, MonitorService
+from services.electricity_status import ElectricityChecker, ElectricityStatus
 from telegram.bot import TelegramBot
 
 
@@ -17,12 +17,12 @@ def cmd_help(bot: TelegramBot, **kwargs) -> None:
         "/start – Show this message\n"
         "/check_electricity – Check if there's power\n"
         "/check_alexa – Check connection to Alexa/1C\n"
-        "/dtek_schedule – Show DTEK outage schedule\n"
+        "/dtek_report – Show the current status and DTEK schedule\n"
     )
 
 
 def cmd_check_electricity(bot: TelegramBot, **kwargs) -> None:
-    """Checks electricity status via Sensu"""
+    """Reply with the current Home Assistant electricity status."""
     logger.info(f"{bot.chat_id}: Checking electricity status")
     bot.send_typing()
 
@@ -32,7 +32,6 @@ def cmd_check_electricity(bot: TelegramBot, **kwargs) -> None:
 
     messages = {
         ElectricityStatus.OK: "🟢 Все добре",
-        ElectricityStatus.WARNING: "🟡 Попередження: стан електроенергії невизначений",
         ElectricityStatus.OUTAGE: "🔴 Відключення електроенергії",
     }
 
@@ -44,22 +43,16 @@ def cmd_check_alexa(bot: TelegramBot, **kwargs) -> None:
     logger.info(f"{bot.chat_id}: Checking Alexa server status")
     bot.send_typing()
 
-    result = check_connection(
-        host=settings.ALEXA_HOST, port=settings.ALEXA_PORT, timeout=5
-    )
+    result = check_connection()
     logger.debug(f"Alexa connectivity result: {result}")
 
     if result == 0:
-        bot.send_message("🟢 Everything's okay 👌")
+        bot.send_message("🟢 Alexa/1C доступна")
     else:
-        bot.send_message("🔴 No connection to 1C 😡")
+        bot.send_message("🔴 Alexa/1C недоступна")
 
 
-def cmd_dtek_schedule(bot: TelegramBot, **kwargs) -> None:
-    """Fetch and send DTEK outage schedule"""
-    logger.info(f"{bot.chat_id}: Fetching DTEK schedule")
-    bot.send_typing()
-
+def build_dtek_service(electricity: ElectricityChecker) -> MonitorService:
     ctx = MonitorContext(
         city=settings.DTEK_CITY,
         street=settings.DTEK_STREET,
@@ -67,9 +60,15 @@ def cmd_dtek_schedule(bot: TelegramBot, **kwargs) -> None:
         state_file=Path(settings.DTEK_STATE_FILE),
         forced_group=None,
     )
+    return MonitorService(ctx, electricity=electricity)
 
-    message = MonitorService(ctx).report()
 
+def cmd_dtek_report(bot: TelegramBot, **kwargs) -> None:
+    """Send the latest power and DTEK report to the requesting chat."""
+    logger.info(f"{bot.chat_id}: Fetching DTEK report")
+    bot.send_typing()
+
+    message = build_dtek_service(kwargs["electricity"]).report()
     bot.send_message(message)
 
 
@@ -79,5 +78,5 @@ COMMANDS: dict[str, Callable] = {
     "/start": cmd_help,
     "/check_electricity": cmd_check_electricity,
     "/check_alexa": cmd_check_alexa,
-    "/dtek_schedule": cmd_dtek_schedule,
+    "/dtek_report": cmd_dtek_report,
 }

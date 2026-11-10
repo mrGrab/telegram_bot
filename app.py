@@ -4,21 +4,15 @@ from flask import Flask, jsonify, request
 
 from core.config import settings
 from core.logger import logger
-from scripts.electricity_status import ElectricityChecker
-from services.sensu_client import SensuClient
+from services.electricity_status import ElectricityChecker
 from telegram.bot import TelegramBot
 from telegram.commands import COMMANDS
 
 app = Flask(__name__)
-sensu_client = SensuClient(
-    url=settings.SENSU_API_URL,
-    api_key=settings.SENSU_API_KEY,
-    namespace=settings.SENSU_NAMESPACE,
-)
 electricity_checker = ElectricityChecker(
-    sensu=sensu_client,
-    check_name="home-electricity",
-    entity_name="adjutant",
+    url=settings.HASS_URL,
+    token=settings.HASS_TOKEN,
+    entity_id=settings.HASS_POWER_ENTITY_ID,
 )
 
 
@@ -37,9 +31,10 @@ def webhook():
     else:
         message = context["message"]
         chat = message.get("chat", {})
+
         if (
             chat.get("type") != "private"
-            or chat.get("id") not in settings.TELEGRAM_ALLOWED_CHAT_IDS
+            or chat.get("id") not in settings.allowed_chat_ids
         ):
             return jsonify({"status": "received"}), 200
         text = message.get("text", "").strip()

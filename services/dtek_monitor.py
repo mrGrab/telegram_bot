@@ -1,48 +1,39 @@
-"""
-Power Outage Monitoring Script for DTEK
-Monitors scheduled power outages and sends notifications via Telegram
-"""
+"""Fetch DTEK outages, format reports, and track scheduled notifications."""
 
 from __future__ import annotations
 
 import fcntl
 import json
-import logging
 import os
 import re
 import tempfile
+import time
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
-from functools import partial
 from html import escape
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
-import click
 import requests
 from pydantic import BaseModel, Field, ValidationError, field_validator
-from rich.console import Console
-
-# Selenium Imports
 from selenium import webdriver
-from selenium.common.exceptions import WebDriverException
+from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 
+from core.logger import logger
+from services.electricity_status import ElectricityChecker, ElectricityStatus
+
 DTEK_URL = "https://www.dtek-krem.com.ua/ua/shutdowns"
 DTEK_AJAX_URL = "https://www.dtek-krem.com.ua/ua/ajax"
+AJAX_TIMEOUT_SECONDS = 15
+SCRIPT_TIMEOUT_SECONDS = AJAX_TIMEOUT_SECONDS + 5
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler()],
-)
-logger = logging.getLogger(__name__)
 DTEK_TIMEZONE = ZoneInfo("Europe/Kyiv")
 
 
@@ -105,11 +96,6 @@ class DaySchedule(BaseModel):
     date: datetime
     periods: list[OutagePeriod] = Field(default_factory=list)
     updated_at: datetime | None = None
-
-    def upcoming_outages(self, now: datetime, minutes_ahead: int) -> list[datetime]:
-        """Return outage starts in the window, including the following day."""
-        end = now + timedelta(minutes=minutes_ahead)
-        return [period.start for period in self.periods if now < period.start <= end]
 
     def format_date(self) -> str:
         """Format date as weekday and date"""
@@ -208,8 +194,10 @@ class DTEKMonitor:
     def fetch(self, city: str, street: str) -> tuple[dict | None, dict | None]:
         """Orchestrates the fetching of both current status (AJAX) and schedule (JS Var)"""
         driver = None
+        stage = "browser startup"
         try:
             driver = self._init_driver()
+            stage = "page load"
             driver.set_page_load_timeout(30)
 
             logger.info(f"Loading page: {DTEK_URL}")
@@ -222,10 +210,12 @@ class DTEKMonitor:
             schedule_json = self._extract_schedule_var(page_source)
 
             # AJAX for Current Status
+            stage = "CSRF token lookup"
             csrf_token = driver.execute_script(
                 "return document.querySelector('meta[name=\"csrf-token\"]').content;"
             )
 
+            stage = "AJAX request"
             logger.info(f"Fetching AJAX data: {DTEK_AJAX_URL}")
             form_body = urlencode(
                 [
@@ -237,23 +227,103 @@ class DTEKMonitor:
                 ]
             )
             js_payload = """
-            return fetch(arguments[0], {
+            const callback = arguments[arguments.length - 1];
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), arguments[3]);
+            fetch(arguments[0], {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
                     "X-Requested-With": "XMLHttpRequest",
                     "X-CSRF-Token": arguments[1]
                 },
-                body: arguments[2]
-            }).then(r => r.json());
+                body: arguments[2],
+                signal: controller.signal
+            }).then(async response => {
+                if (!response.ok) {
+                    return {kind: "http_error", status: response.status};
+                }
+                try {
+                    return {kind: "ok", status: response.status, data: await response.json()};
+                } catch (error) {
+                    if (error.name === "AbortError") {
+                        return {kind: "timeout", error_name: "AbortError"};
+                    }
+                    return {
+                        kind: "invalid_json", status: response.status,
+                        content_type: response.headers.get("content-type")
+                    };
+                }
+            }).catch(error => ({
+                kind: error.name === "AbortError" ? "timeout" : "network_error",
+                error_name: error.name || "Error",
+                error_message: String(error.message || "").slice(0, 200)
+            })).then(result => {
+                clearTimeout(timer);
+                callback(result);
+            });
             """
-            outage_json = driver.execute_script(
-                js_payload, DTEK_AJAX_URL, csrf_token, form_body
+            driver.set_script_timeout(SCRIPT_TIMEOUT_SECONDS)
+            started = time.monotonic()
+            ajax_result = driver.execute_async_script(
+                js_payload,
+                DTEK_AJAX_URL,
+                csrf_token,
+                form_body,
+                AJAX_TIMEOUT_SECONDS * 1000,
+            )
+            elapsed = time.monotonic() - started
+            if not isinstance(ajax_result, dict):
+                logger.warning(
+                    "DTEK AJAX returned an invalid script result (%s) after %.1fs",
+                    type(ajax_result).__name__,
+                    elapsed,
+                )
+                return None, None
+
+            kind = ajax_result.get("kind")
+            if kind != "ok":
+                logger.warning(
+                    "DTEK AJAX failed: %s (HTTP %s, %s, %.1fs)",
+                    kind or "unknown_error",
+                    ajax_result.get("status", "none"),
+                    ajax_result.get("error_message")
+                    or ajax_result.get("error_name")
+                    or ajax_result.get("content_type")
+                    or "no detail",
+                    elapsed,
+                )
+                return None, None
+
+            outage_json = ajax_result.get("data")
+            if not isinstance(outage_json, dict):
+                logger.warning(
+                    "DTEK AJAX JSON root is %s (HTTP %s, %.1fs)",
+                    type(outage_json).__name__,
+                    ajax_result.get("status", "unknown"),
+                    elapsed,
+                )
+                return None, None
+            if not outage_json.get("result"):
+                logger.warning(
+                    "DTEK AJAX JSON result is %s (HTTP %s, %.1fs)",
+                    "missing" if "result" not in outage_json else "false",
+                    ajax_result.get("status", "unknown"),
+                    elapsed,
+                )
+                return None, None
+            logger.info(
+                "DTEK AJAX succeeded (HTTP %s, %.1fs)",
+                ajax_result.get("status"),
+                elapsed,
             )
             return outage_json, schedule_json
 
+        except TimeoutException:
+            logger.exception("DTEK %s exceeded its timeout", stage)
+            return None, None
         except WebDriverException:
-            logger.exception("Browser error")
+            logger.exception("DTEK browser error during %s", stage)
             return None, None
         finally:
             if driver:
@@ -288,12 +358,15 @@ class MessageFormatter:
         return lines
 
     def format_alert_status(
-        self, outage: CurrentOutage, upcoming: list[datetime], now: datetime
+        self,
+        electricity_status: ElectricityStatus,
+        upcoming: list[datetime],
+        now: datetime,
     ) -> list[str]:
         """Generate alert section for active outages or upcoming warnings"""
         lines = []
 
-        if outage.is_active:
+        if electricity_status == ElectricityStatus.OUTAGE:
             lines.append("\n🔴 <b>Світло відсутнє!</b>")
         for start in upcoming:
             mins = max(0, int((start - now).total_seconds() / 60))
@@ -301,23 +374,39 @@ class MessageFormatter:
 
         return lines
 
-    def format_current_status(self, outage: CurrentOutage) -> list[str]:
-        """Generate current outage status section"""
-        lines = ["\n📌 <b>Поточне відключення</b>"]
+    def format_current_status(
+        self, electricity_status: ElectricityStatus, outage: CurrentOutage
+    ) -> list[str]:
+        """Generate the live power status with available DTEK context."""
+        lines = ["\n📌 <b>Поточний стан електропостачання</b>"]
+        status_messages = {
+            ElectricityStatus.OK: "✅ Зараз світло є",
+            ElectricityStatus.OUTAGE: "🔴 Зараз світла немає",
+            ElectricityStatus.UNKNOWN: "⚫️ Не вдалося перевірити поточний стан",
+        }
+        lines.append(status_messages[electricity_status])
 
-        if outage.is_active:
-            if outage.sub_type:
-                lines.append(escape(outage.sub_type))
-            time_range = outage.format_time_range()
-            if time_range:
-                lines.append(time_range)
-        else:
-            lines.append("✅ Зараз відключень немає")
-
-        if outage.updated_at:
-            lines.append(f"<i>Оновлено:</i> {outage.updated_at.strftime('%H:%M')}")
+        if outage.sub_type:
+            lines.append(f"Причина за даними ДТЕК: {escape(outage.sub_type)}")
+        time_range = outage.format_time_range()
+        if time_range:
+            lines.append(f"Час за даними ДТЕК (орієнтовно): {time_range}")
 
         return lines
+
+    def format_unavailable_report(
+        self, electricity_status: ElectricityStatus, outage: CurrentOutage
+    ) -> str:
+        """Show live power status when the DTEK schedule cannot be read."""
+        if electricity_status == ElectricityStatus.UNKNOWN:
+            return "⚫️ Не вдалося перевірити поточний стан і графік ДТЕК"
+        lines = self.format_header(outage)
+        if electricity_status == ElectricityStatus.OUTAGE:
+            lines.append("\n🔴 <b>Світло відсутнє!</b>")
+        lines.extend(self.format_current_status(electricity_status, outage))
+        lines.append("\n📅 <b>Графік відключень</b>")
+        lines.append("⚠️ Графік ДТЕК недоступний")
+        return "\n".join(lines)
 
     def format_schedule(self, schedules: list[DaySchedule]) -> list[str]:
         """Generate schedule section with daily outage periods"""
@@ -345,6 +434,7 @@ class MessageFormatter:
 
     def generate_report(
         self,
+        electricity_status: ElectricityStatus,
         outage: CurrentOutage,
         schedules: list[DaySchedule],
         upcoming: list[datetime],
@@ -354,8 +444,8 @@ class MessageFormatter:
         lines = []
 
         lines.extend(self.format_header(outage))
-        lines.extend(self.format_alert_status(outage, upcoming, now))
-        lines.extend(self.format_current_status(outage))
+        lines.extend(self.format_alert_status(electricity_status, upcoming, now))
+        lines.extend(self.format_current_status(electricity_status, outage))
         lines.extend(self.format_schedule(schedules))
 
         return "\n".join(lines)
@@ -614,9 +704,6 @@ class ChatState(BaseModel):
 class NotificationState(BaseModel):
     version: int = 2
     chats: dict[str, ChatState] = Field(default_factory=dict)
-    failure_active: bool = False
-    failure_notified: set[str] = Field(default_factory=set)
-    recovery_pending: set[str] = Field(default_factory=set)
 
 
 @dataclass(frozen=True)
@@ -626,6 +713,68 @@ class Observation:
     upcoming: list[datetime]
     message: str
     observed_at: datetime
+    suppressed_upcoming: list[datetime] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class ChatPlan:
+    """What to do for one chat after an observation.
+
+    baseline: store next_state now, send nothing.
+    silent: nothing changed, store nothing.
+    alert: send message, and store next_state only once delivery is accepted.
+    """
+
+    kind: Literal["baseline", "silent", "alert"]
+    next_state: ChatState
+    message: str = ""
+
+
+def _days_from(periods_json: str, today: datetime) -> list[dict]:
+    """Schedule days dated today or later; midnight rollover must not look like a change."""
+    try:
+        days = json.loads(periods_json)
+    except json.JSONDecodeError:
+        return []
+    today_key = today.strftime("%Y-%m-%d")
+    return [
+        day
+        for day in days
+        if not isinstance(day, dict) or day.get("date", "") >= today_key
+    ]
+
+
+def plan_chat(previous: ChatState | None, observation: Observation) -> ChatPlan:
+    """Decide one chat's scheduled alert from its last acknowledged state."""
+    upcoming_keys = {start.isoformat() for start in observation.upcoming}
+    suppressed_keys = {start.isoformat() for start in observation.suppressed_upcoming}
+    cutoff = (observation.observed_at - timedelta(days=1)).isoformat()
+    warned = previous.warned_starts if previous else set()
+    next_state = ChatState(
+        outage=observation.outage,
+        schedule_periods=observation.schedule_periods,
+        warned_starts={key for key in warned if key >= cutoff}
+        | upcoming_keys
+        | suppressed_keys,
+    )
+    if previous is None:
+        return ChatPlan("baseline", next_state)
+
+    reasons = []
+    if previous.outage != observation.outage:
+        reasons.append("ЗМІНА ВІДКЛЮЧЕННЯ")
+    today = observation.observed_at
+    if _days_from(previous.schedule_periods, today) != _days_from(
+        observation.schedule_periods, today
+    ):
+        reasons.append("ЗМІНА ГРАФІКА")
+    if upcoming_keys - warned:
+        reasons.append("НАБЛИЖАЄТЬСЯ ВІДКЛЮЧЕННЯ")
+    if not reasons:
+        return ChatPlan("silent", next_state)
+
+    headers = "\n".join(f"<code>{reason}</code>" for reason in reasons)
+    return ChatPlan("alert", next_state, f"{headers}\n\n{observation.message}")
 
 
 # ============================================================================
@@ -637,41 +786,61 @@ class MonitorService:
     def __init__(
         self,
         ctx: MonitorContext,
+        electricity: ElectricityChecker,
         source: DTEKMonitor | None = None,
         state: StateManager | None = None,
         clock: Callable[[], datetime] | None = None,
     ):
         self.ctx = ctx
+        self.electricity = electricity
         self.source = source if source is not None else DTEKMonitor()
         self.state = state if state is not None else StateManager()
         self.clock = clock if clock is not None else lambda: datetime.now(DTEK_TIMEZONE)
         self.formatter = MessageFormatter(ctx)
 
     def _observe(self) -> tuple[Observation | None, str]:
+        electricity_status = self.electricity.check().status
+        outage = CurrentOutage()
         try:
             outage_data, schedule_data = self.source.fetch(
                 city=self.ctx.city, street=self.ctx.street
             )
             if not outage_data:
-                return None, "❌ Помилка отримання даних про відключення"
+                return None, self.formatter.format_unavailable_report(
+                    electricity_status, outage
+                )
             outage = parse_current_outage(outage_data, self.ctx.building)
             group = self.ctx.forced_group or outage.group
             schedules = ScheduleParser(schedule_data, group).parse()
             now = _dtek_time(self.clock())
-            upcoming = sorted(
-                start for day in schedules for start in day.upcoming_outages(now, 25)
+            ends = {(p.end, p.type) for day in schedules for p in day.periods}
+            # A start equal to another period's end is the same outage split at midnight
+            starts = sorted(
+                period.start
+                for day in schedules
+                for period in day.periods
+                if (period.start, period.type) not in ends
+                and now < period.start <= now + timedelta(minutes=25)
             )
-            message = self.formatter.generate_report(outage, schedules, upcoming, now)
+            # No warning while power is already off; starts are still marked as warned
+            power_off = electricity_status == ElectricityStatus.OUTAGE
+            upcoming = [] if power_off else starts
+            message = self.formatter.generate_report(
+                electricity_status, outage, schedules, upcoming, now
+            )
             return Observation(
                 outage=outage,
                 schedule_periods=get_schedule_periods_json(schedules),
                 upcoming=upcoming,
                 message=message,
                 observed_at=now,
+                suppressed_upcoming=starts if power_off else [],
             ), ""
         except ValueError, TypeError, WebDriverException:
             logger.exception("DTEK observation failed")
-            return None, "❌ Помилка отримання графіка відключень"
+            return None, self.formatter.format_unavailable_report(
+                electricity_status, outage
+            )
 
     def report(self) -> str:
         """Fetch a report without reading or changing notification state."""
@@ -692,13 +861,8 @@ class MonitorService:
             self.state.save(self.ctx.state_file, state)
             observation, error = self._observe()
             if observation is None:
-                self._notify_failure(state, chat_ids, send, error)
+                logger.warning("DTEK monitoring failed; scheduled report skipped")
                 return error
-            if state.failure_active:
-                state.failure_active = False
-                state.recovery_pending = set(state.failure_notified)
-                state.failure_notified.clear()
-                self.state.save(self.ctx.state_file, state)
             self._notify_report(state, chat_ids, send, observation)
             return observation.message
 
@@ -711,25 +875,6 @@ class MonitorService:
             logger.exception("Failed to send DTEK alert to %s", chat_id)
             return False
 
-    def _notify_failure(
-        self,
-        state: NotificationState,
-        chat_ids: tuple[str, ...],
-        send: Callable[[str, str], bool],
-        error: str,
-    ) -> None:
-        if not state.failure_active:
-            state.failure_active = True
-            state.failure_notified.clear()
-            state.recovery_pending.clear()
-            self.state.save(self.ctx.state_file, state)
-        for chat_id in dict.fromkeys(chat_ids):
-            if chat_id in state.failure_notified:
-                continue
-            if self._send(send, chat_id, error):
-                state.failure_notified.add(chat_id)
-                self.state.save(self.ctx.state_file, state)
-
     def _notify_report(
         self,
         state: NotificationState,
@@ -737,52 +882,23 @@ class MonitorService:
         send: Callable[[str, str], bool],
         observation: Observation,
     ) -> None:
-        upcoming_keys = {start.isoformat() for start in observation.upcoming}
-        cutoff = (observation.observed_at - timedelta(days=1)).isoformat()
         for chat_id in dict.fromkeys(chat_ids):
-            previous = state.chats.get(chat_id)
-            reasons = self._report_reasons(
-                previous,
-                observation,
-                upcoming_keys,
-                chat_id in state.recovery_pending,
-            )
-            warned = previous.warned_starts if previous else set()
-            if not reasons:
-                continue
-            headers = "\n".join(f"<code>{reason}</code>" for reason in reasons)
-            message = f"{headers}\n\n{observation.message}"
-            if self._send(send, chat_id, message):
-                state.chats[chat_id] = ChatState(
-                    outage=observation.outage,
-                    schedule_periods=observation.schedule_periods,
-                    warned_starts={key for key in warned if key >= cutoff}
-                    | upcoming_keys,
-                )
-                state.recovery_pending.discard(chat_id)
+            plan = plan_chat(state.chats.get(chat_id), observation)
+            if plan.kind == "baseline":
+                state.chats[chat_id] = plan.next_state
                 self.state.save(self.ctx.state_file, state)
-
-    @staticmethod
-    def _report_reasons(
-        previous: ChatState | None,
-        observation: Observation,
-        upcoming_keys: set[str],
-        recovering: bool,
-    ) -> list[str]:
-        reasons = []
-        if previous is None:
-            reasons.append("ПОЧАТКОВИЙ ЗВІТ")
-        else:
-            if previous.outage != observation.outage:
-                reasons.append("ЗМІНА ВІДКЛЮЧЕННЯ")
-            if previous.schedule_periods != observation.schedule_periods:
-                reasons.append("ЗМІНА ГРАФІКА")
-        warned = previous.warned_starts if previous else set()
-        if upcoming_keys - warned:
-            reasons.append("НАБЛИЖАЄТЬСЯ ВІДКЛЮЧЕННЯ")
-        if recovering:
-            reasons.append("МОНІТОРИНГ ВІДНОВЛЕНО")
-        return reasons
+                logger.info("DTEK baseline saved for chat %s; no message sent", chat_id)
+            elif plan.kind == "silent":
+                if plan.next_state.warned_starts != state.chats[chat_id].warned_starts:
+                    # Remember suppressed warnings so they are not sent late
+                    state.chats[chat_id] = plan.next_state
+                    self.state.save(self.ctx.state_file, state)
+                logger.info(
+                    "DTEK report unchanged for chat %s; no message sent", chat_id
+                )
+            elif self._send(send, chat_id, plan.message):
+                state.chats[chat_id] = plan.next_state
+                self.state.save(self.ctx.state_file, state)
 
 
 # ============================================================================
@@ -834,100 +950,3 @@ def get_schedule_periods_json(schedules: list[DaySchedule]) -> str:
         data.append(day_data)
 
     return json.dumps(data, sort_keys=True, ensure_ascii=False)
-
-
-def send_telegram_notification(token: str, chat_id: str, message: str) -> bool:
-    """Return whether Telegram accepted one chat's alert."""
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    try:
-        data = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
-        response = requests.post(url, data=data, timeout=5)
-        response.raise_for_status()
-        if response.json().get("ok") is not True:
-            raise ValueError("Telegram did not accept the message")
-        logger.info(f"Notification sent to {chat_id}")
-        return True
-    except requests.RequestException, ValueError:
-        logger.exception("Failed to send to %s", chat_id)
-        return False
-
-
-@click.command()
-@click.option(
-    "--city",
-    default=lambda: os.environ.get("DTEK_CITY"),
-    required=True,
-    help="City for monitoring",
-)
-@click.option(
-    "--street",
-    default=lambda: os.environ.get("DTEK_STREET"),
-    required=True,
-    help="Street for monitoring",
-)
-@click.option(
-    "--building",
-    default=lambda: os.environ.get("DTEK_BUILDING"),
-    required=True,
-    help="Building number for monitoring",
-)
-@click.option(
-    "--forced-group", default=None, help="Force specific group for schedule parsing"
-)
-@click.option(
-    "--telegram-token",
-    default=lambda: os.environ.get("BOT_TOKEN"),
-    help="Telegram Bot Token",
-)
-@click.option("--chat-id", multiple=True, help="Telegram Chat ID(s)")
-@click.option(
-    "--state-file",
-    default=lambda: os.environ.get("DTEK_STATE_FILE"),
-    help="Path to state file",
-)
-@click.option(
-    "--output",
-    type=click.Choice(["text", "html"]),
-    default="text",
-    help="Output format",
-)
-def main(
-    city, street, building, forced_group, telegram_token, chat_id, state_file, output
-):
-    """DTEK Power Outage Monitor"""
-
-    if not state_file:
-        state_file = "last_state.json"
-
-    # Create context
-    ctx = MonitorContext(
-        city=city,
-        street=street,
-        building=building,
-        forced_group=forced_group,
-        state_file=Path(state_file),
-    )
-
-    monitor = MonitorService(ctx)
-    if chat_id and not telegram_token:
-        raise click.UsageError("--telegram-token is required when --chat-id is set")
-    if telegram_token and chat_id:
-        message = monitor.notify(
-            chat_id, partial(send_telegram_notification, telegram_token)
-        )
-        if message is None:
-            click.echo("DTEK monitoring run skipped because another run is active")
-            return
-    else:
-        message = monitor.report()
-
-    if output == "html":
-        print(message)
-    else:
-        console = Console()
-        clean_msg = re.sub(r"<[^>]+>", "", message)
-        console.print(clean_msg)
-
-
-if __name__ == "__main__":
-    main()
